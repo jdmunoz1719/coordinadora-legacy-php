@@ -19,6 +19,7 @@ class Incident
     private ?string $applicationName;
     private int $severityId;
     private ?string $severityName;
+    private ?string $severityColor;
     private ?string $statusName;
     private ?string $assignedToId;
     private ?string $assignedToName;
@@ -33,6 +34,7 @@ class Incident
         $this->applicationName = $data['applicationName'] ?? null;
         $this->severityId = (int) ($data['severityId'] ?? throw new \InvalidArgumentException('Missing "severityId"'));
         $this->severityName = $data['severityName'] ?? null;
+        $this->severityColor = $data['severityColor'] ?? null;
         $this->statusName = $data['statusName'] ?? null;
         $this->assignedToId = $data['assignedToId'] ?? null;
         $this->assignedToName = $data['assignedToName'] ?? null;
@@ -96,6 +98,11 @@ class Incident
         return $this->createdAt;
     }
 
+    public function getSeverityColor(): ?string
+    {
+        return $this->severityColor;
+    }
+
     /**
      * Convierte a array para serialización (JSON, CSV, etc).
      */
@@ -109,6 +116,7 @@ class Incident
             'applicationName' => $this->applicationName,
             'severityId' => $this->severityId,
             'severityName' => $this->severityName,
+            'severityColor' => $this->severityColor,
             'statusName' => $this->statusName,
             'assignedToId' => $this->assignedToId,
             'assignedToName' => $this->assignedToName,

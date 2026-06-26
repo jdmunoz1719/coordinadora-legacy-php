@@ -1,353 +1,278 @@
-# Detalles de Integración - Cliente PHP Legacy
+# Mecanismo de Integración: Legacy PHP ↔ NestJS
 
-Documentación técnica para integrar el cliente PHP con la API moderna de gestión de incidentes.
+## Visión general
 
-## Flujo de Integración
+El componente legacy es un cliente PHP que consume **un único endpoint** de la API moderna. No tiene base de datos propia ni acceso a otros servicios — toda la lógica de negocio, persistencia y paginación vive en el backend NestJS.
 
 ```
-Código Legacy (PHP)
-    ↓
-IncidentClient::getIncidents()
-    ↓
-HTTP GET /api/incidents?page=1&limit=50
-    ↓
-API REST (NestJS + PostgreSQL)
-    ↓
-Response JSON con datos estructurados
-    ↓
-IncidentClient parsea → Incident DTOs
-    ↓
-Código Legacy usa Incident objects
+┌────────────────────────────────┐        ┌──────────────────────────────────────────────┐
+│         LEGACY (PHP)           │        │              MODERNO (NestJS)                 │
+│                                │        │                                              │
+│  legacy_dashboard.php          │  HTTP  │  GET /api/incidents/open                     │
+│  fetch_incidents.php     ──────┼──GET──►│                                              │
+│                                │        │  IncidentsController                         │
+│  IncidentClient                │        │  └─ ListOpenIncidentsUseCase                 │
+│  └─ getOpenIncidents()  ◄──────┼──JSON──│     └─ IncidentPrismaRepository.findAllOpen()│
+│     └─ cURL + retry            │        │        └─ PostgreSQL                         │
+│        └─ Incident[]           │        │                                              │
+└────────────────────────────────┘        └──────────────────────────────────────────────┘
 ```
 
-## Endpoints Consumidos
+---
 
-### GET /incidents
+## Contrato de la API
 
-Lista incidentes paginados.
+### Endpoint
 
-**Request:**
 ```
-GET http://localhost:3001/api/incidents?page=1&limit=50
+GET {INCIDENT_API_URL}/api/incidents/open
 ```
 
-**Query Parameters:**
-- `page` (int, default: 1) - Número de página
-- `limit` (int, default: 10, max: 100) - Items por página
+### Query params (todos opcionales)
 
-**Response (200 OK):**
+| Parámetro       | Tipo   | Descripción                               |
+|-----------------|--------|-------------------------------------------|
+| `page`          | number | Número de página (default: 1)             |
+| `limit`         | number | Resultados por página (default: 10)       |
+| `applicationId` | string | UUID de la aplicación para filtrar        |
+| `severityId`    | number | ID numérico del nivel de severidad        |
+
+### Respuesta exitosa — `200 OK`
+
 ```json
 {
-  "items": [
+  "data": [
     {
-      "id": "incident-uuid",
-      "title": "Database Connection Timeout",
-      "description": "Connection pool exhausted",
-      "applicationId": "app-uuid-123",
-      "applicationName": "payment-service",
-      "severityId": 5,
+      "id": "550e8400-e29b-41d4-a716-446655440000",
+      "title": "API de pagos sin respuesta",
+      "description": "El servicio de pagos lleva 15 minutos sin responder.",
+      "applicationId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+      "applicationName": "Payment Service",
+      "severityId": 1,
       "severityName": "CRITICAL",
+      "severityColor": "#ef4444",
       "statusName": "OPEN",
-      "assignedToId": "user-uuid-456",
-      "assignedToName": "John Doe",
-      "createdAt": "2026-06-22T10:30:00Z"
+      "assignedToId": null,
+      "assignedToName": null,
+      "createdAt": "2025-06-20T14:32:00.000Z"
     }
   ],
-  "total": 42
+  "total": 42,
+  "page": 1,
+  "limit": 20,
+  "totalPages": 3,
+  "hasNextPage": true,
+  "hasPreviousPage": false
 }
 ```
 
-**Error (5xx):**
-- Reintentar con backoff exponencial
-- Máximo 3 reintentos
-- Intervalo: 1s → 2s → 4s
+> El backend filtra automáticamente por `status = OPEN`. No es posible recibir incidentes con otro estado desde este endpoint.
 
-### PATCH /incidents/:id/update-status
+### Errores posibles
 
-Cambia estado de incidente.
+| HTTP | Causa                                              | Comportamiento PHP                          |
+|------|----------------------------------------------------|---------------------------------------------|
+| 400  | Query params con formato inválido                  | Lanza `IncidentClientException`, sin reintentos |
+| 401  | Credenciales inválidas (si auth está activo)       | Lanza `IncidentClientException`, sin reintentos |
+| 404  | Ruta incorrecta (fallo de config)                  | Lanza `IncidentClientException`, sin reintentos |
+| 429  | Rate limit                                         | Reintenta con backoff exponencial           |
+| 500  | Error interno del backend                          | Reintenta hasta `maxRetries` veces          |
+| —    | Timeout de red                                     | Reintenta hasta `maxRetries` veces          |
+| —    | Error de conexión (DNS, refused)                   | Reintenta hasta `maxRetries` veces          |
 
-**Request:**
+---
+
+## Implementación del cliente
+
+### Flujo de `getOpenIncidents()`
+
 ```
-PATCH http://localhost:3001/api/incidents/incident-uuid/update-status
-Content-Type: application/json
-
-{
-  "newStatus": "IN_PROGRESS",
-  "reason": "Started investigation"
-}
+getOpenIncidents($filters)
+│
+├─ Construir query string desde $filters
+│   applicationId → string (UUID)
+│   severityId    → int (>= 1)
+│   page          → int (>= 1)
+│   limit         → int (1–100)
+│
+├─ cURL GET {INCIDENT_API_URL}/api/incidents/open?{query}
+│   Headers:
+│     Accept: application/json
+│     Content-Type: application/json
+│
+├─ ¿HTTP >= 400?
+│   ├─ 4xx → throw IncidentClientException (NO reintentar)
+│   └─ 5xx → reintentar (hasta maxRetries, backoff exponencial)
+│
+├─ json_decode($body, true)
+│   └─ $data['data'] → array de incidentes crudos
+│
+├─ Mapear cada item → new Incident(array)
+│   id              ← $item['id']
+│   title           ← $item['title']
+│   description     ← $item['description']
+│   applicationId   ← $item['applicationId']
+│   applicationName ← $item['applicationName'] ?? null
+│   severityId      ← (int) $item['severityId']
+│   severityName    ← $item['severityName'] ?? null
+│   statusName      ← $item['statusName'] ?? null
+│   assignedToId    ← $item['assignedToId'] ?? null
+│   assignedToName  ← $item['assignedToName'] ?? null
+│   createdAt       ← new DateTimeImmutable($item['createdAt'])
+│
+└─ Retornar:
+    [
+      'incidents'  => Incident[],
+      'total'      => $data['total'],
+      'page'       => $data['page'],
+      'limit'      => $data['limit'],
+      'totalPages' => $data['totalPages'],
+    ]
 ```
 
-**Parameters:**
-- `newStatus` (string) - Nuevo estado (OPEN, IN_PROGRESS, RESOLVED)
-- `reason` (string) - Motivo del cambio
-
-**Response (200 OK):**
-```json
-{
-  "id": "incident-uuid",
-  "statusName": "IN_PROGRESS",
-  "updatedAt": "2026-06-23T14:35:00Z"
-}
-```
-
-**Errores:**
-- 404: Incidente no encontrado
-- 400: Status inválido
-- 5xx: Reintentar
-
-## Configuración de Cliente
-
-### Por Ambiente
+### Estrategia de reintentos
 
 ```php
-// .env
-INCIDENT_API_URL=http://localhost:3001/api
+$maxRetries = 3;     // configurable con setMaxRetries()
+$attempt    = 0;
+
+while ($attempt < $maxRetries) {
+    $response = curlRequest(...);
+
+    if ($response->httpCode < 400) break;          // éxito
+    if ($response->httpCode < 500) throw ...;      // 4xx: no reintentar
+
+    $attempt++;
+    if ($attempt < $maxRetries) {
+        sleep(2 ** $attempt);                      // 2s → 4s → 8s
+    }
+}
+```
+
+---
+
+## Mapeo de datos: API JSON → PHP
+
+| Campo JSON         | Tipo JSON    | Getter PHP                | Tipo PHP             |
+|--------------------|--------------|---------------------------|----------------------|
+| `id`               | string       | `getId()`                 | `string`             |
+| `title`            | string       | `getTitle()`              | `string`             |
+| `description`      | string       | `getDescription()`        | `string`             |
+| `applicationId`    | string       | `getApplicationId()`      | `string`             |
+| `applicationName`  | string\|null | `getApplicationName()`    | `?string`            |
+| `severityId`       | number       | `getSeverityId()`         | `int`                |
+| `severityName`     | string\|null | `getSeverityName()`       | `?string`            |
+| `statusName`       | string\|null | `getStatusName()`         | `?string` (= "OPEN") |
+| `assignedToId`     | string\|null | `getAssignedToId()`       | `?string`            |
+| `assignedToName`   | string\|null | `getAssignedToName()`     | `?string`            |
+| `createdAt`        | ISO 8601     | `getCreatedAt()`          | `DateTimeImmutable`  |
+
+> `severityColor` está disponible en el JSON pero no se mapea al modelo PHP — el dashboard legacy usa clases CSS propias basadas en el nombre de severidad.
+
+---
+
+## Configuración
+
+El cliente se configura con variables de entorno (`.env`) o por inyección directa:
+
+```php
+// Por variables de entorno (.env)
+INCIDENT_API_URL=http://localhost:3001
 INCIDENT_API_TIMEOUT=10
-LOG_LEVEL=info
-LOG_PATH=var/log/legacy-integration.log
-```
+INCIDENT_VERIFY_SSL=true
 
-### Desarrollo
-```
-INCIDENT_API_URL=http://localhost:3001/api
-INCIDENT_API_TIMEOUT=10
-LOG_LEVEL=debug
-```
-
-### Producción
-```
-INCIDENT_API_URL=https://api.coordinadora.com/api
-INCIDENT_API_TIMEOUT=30
-LOG_LEVEL=warning
-```
-
-## Manejo de Errores
-
-### Reintentos Automáticos
-
-Client reintenta en:
-- HTTP 408 (Request Timeout)
-- HTTP 429 (Too Many Requests)
-- HTTP 500, 502, 503 (Server Errors)
-- Connection timeout
-
-**Estrategia:**
-```
-Intento 1: 1s delay
-Intento 2: 2s delay
-Intento 3: 4s delay
-Falla: throw IncidentClientException
-```
-
-### Excepciones
-
-```php
-try {
-    $incidents = $client->getIncidents(['page' => 1]);
-} catch (IncidentClientException $e) {
-    // $e->getMessage()       - Error message
-    // $e->getStatusCode()    - HTTP status code (null si network error)
-    // $e->getPrevious()      - Causa original
-    
-    error_log($e->getMessage());
-    
-    // Implementar lógica de fallback
-    // - Usar cache
-    // - Datos por defecto
-    // - Alertar admin
-}
-```
-
-## Performance
-
-### Paginación
-
-Usar paginación para queries grandes:
-
-```php
-// MAL: Sin paginación
-$allIncidents = [];
-for ($page = 1; $page <= 100; $page++) {
-    $allIncidents = array_merge(
-        $allIncidents,
-        $client->getIncidents(['page' => $page, 'limit' => 100])
-    );
-}
-
-// BIEN: Con límite
-$incidents = $client->getIncidents([
-    'page' => 1,
-    'limit' => 50,
+// Por constructor (sobreescribe env vars)
+$client = new IncidentClient([
+    'base_url'   => 'https://api.coordinadora.com',
+    'timeout'    => 30,
+    'verify_ssl' => false,    // en desarrollo con certificados autofirmados
 ]);
-
-// Procesar items
-foreach ($incidents as $incident) {
-    // ...
-}
-
-// Cargar siguiente página si es necesario
-if (count($incidents) >= 50) {
-    $nextPage = $client->getIncidents([
-        'page' => 2,
-        'limit' => 50,
-    ]);
-}
 ```
 
-### Caching
+> **Importante:** `INCIDENT_API_URL` apunta a la raíz del backend (ej. `http://localhost:3001`), no incluye `/api`. El cliente antepone `/api/incidents/open` internamente.
 
-Consideraciones:
-- Cachear datos maestros (app names, severities) por horas
-- Cachear lista de incidentes por minutos
-- Invalidar cache en cambios de estado
+---
 
-```php
-$cacheKey = 'incidents_page_1_limit_50';
-$ttl = 300; // 5 minutos
+## Arquitectura de la solución moderna
 
-if ($cache->has($cacheKey)) {
-    $incidents = $cache->get($cacheKey);
-} else {
-    $incidents = $client->getIncidents(['page' => 1, 'limit' => 50]);
-    $cache->set($cacheKey, $incidents, $ttl);
-}
-```
-
-## Logging
-
-### Niveles
+La API que consume el legacy sigue arquitectura hexagonal (DDD):
 
 ```
-debug   - Requests/responses detallados
-info    - Operaciones exitosas
-warning - Reintentos, errores recuperables
-error   - Errores no recuperables
+Presentation  →  Application  →  Domain  →  Infrastructure
+────────────     ───────────     ──────     ──────────────
+Controller        UseCase        Port       PrismaRepository
+(HTTP/DTO)       (orquesta)    (interfaz)   (Prisma + PG)
 ```
 
-### Uso
-
-```php
-$client->setLogLevel('debug');
-
-// Log automático en:
-// - Cada request HTTP
-// - Reintentos
-// - Errores
-// - Parsing de responses
-```
-
-### Archivo Log
+**Módulo de incidentes relevante:**
 
 ```
-var/log/legacy-integration.log
-
-Formato:
-[2026-06-24 14:35:00] INFO: GET /incidents - Status 200 - 145ms
-[2026-06-24 14:35:05] WARN: Retry attempt 1/3 - Status 503
-[2026-06-24 14:35:06] ERROR: IncidentClientException - Connection timeout
+backend/src/features/incidents/
+├── presentation/
+│   ├── incidents.controller.ts                    # GET /incidents/open
+│   └── dtos/
+│       └── list-open-incidents-filter.dto.ts      # applicationId?, severityId?
+├── application/
+│   └── use-cases/
+│       └── list-open-incidents.use-case.ts
+├── domain/
+│   └── ports/
+│       └── incident-repository.port.ts            # findAllOpen()
+└── infrastructure/
+    └── repositories/
+        └── incident-prisma.repository.ts          # WHERE currentStatusId = 1
 ```
 
-## Validación de Datos
+---
 
-### Incident DTO
+## Agregar un nuevo campo al contrato
 
-```php
-$incident->getId()              // string - UUID
-$incident->getTitle()           // string
-$incident->getDescription()     // string
-$incident->getApplicationId()   // string - UUID
-$incident->getApplicationName() // string
-$incident->getSeverityId()      // int - 1-5
-$incident->getSeverityName()    // string - INFO, LOW, MEDIUM, HIGH, CRITICAL
-$incident->getStatusName()      // string - OPEN, IN_PROGRESS, RESOLVED
-$incident->getAssignedToId()    // ?string - Puede ser null
-$incident->getAssignedToName()  // ?string - Puede ser null
-$incident->getCreatedAt()       // DateTime
-```
+Si el backend expone un nuevo campo y se quiere consumir en el legacy:
 
-### Validación Recomendada
+1. Verificar que el campo aparece en la respuesta JSON (Swagger disponible en `/api/docs`).
+2. **`src/Models/Incident.php`** — agregar propiedad privada y getter.
+3. **`src/IncidentClient.php`** — mapear `$item['nuevoCampo'] ?? null` en el constructor del modelo.
+4. **`examples/legacy_dashboard.php`** — usar el getter en la tabla HTML si aplica.
+5. **`tests/IncidentTest.php`** — agregar el campo al array de datos de prueba.
 
-```php
-if (!$incident->getId()) {
-    throw new InvalidArgumentException('Incident ID is required');
-}
-
-if (!in_array($incident->getSeverityName(), ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO'])) {
-    throw new InvalidArgumentException('Invalid severity');
-}
-
-if (!in_array($incident->getStatusName(), ['OPEN', 'IN_PROGRESS', 'RESOLVED'])) {
-    throw new InvalidArgumentException('Invalid status');
-}
-```
-
-## Testing
-
-### Unit Tests
-
-```bash
-composer test
-```
-
-Cubre:
-- IncidentClient::getIncidents()
-- IncidentClient::updateIncidentStatus()
-- Manejo de errores
-- Parsing de responses
-- Reintentos
-
-### Integration Tests (Manual)
-
-1. Verificar API está corriendo:
-   ```bash
-   curl http://localhost:3001/api/incidents
-   ```
-
-2. Ejecutar ejemplo:
-   ```bash
-   php examples/fetch_incidents.php
-   ```
-
-3. Validar logs:
-   ```bash
-   tail -f var/log/legacy-integration.log
-   ```
+---
 
 ## Troubleshooting
 
-### "Connection refused"
-- API no está corriendo
-- URL incorrecta en .env
-- Firewall bloqueando puerto 3001
+### "Connection refused" o "Could not connect"
 
-**Solución:**
+- Backend NestJS no está corriendo
+- `INCIDENT_API_URL` apunta a host/puerto incorrecto
+
 ```bash
-# Verificar API
-curl -i http://localhost:3001/api/incidents
-
-# Actualizar .env
-INCIDENT_API_URL=http://localhost:3001/api
+# Verificar que el backend responde
+curl http://localhost:3001/api/incidents/open?limit=1
 ```
 
-### "HTTP 401 Unauthorized"
-- Sin autenticación implementada aún
-- Verificar headers requeridos
+### "HTTP 404"
 
-### "HTTP 429 Too Many Requests"
-- Rate limiting activo
-- Reducir frecuencia de requests
-- Implementar caché
+- Verificar que `INCIDENT_API_URL` no incluye `/api` al final (el cliente lo agrega)
+- Correcto: `http://localhost:3001`
+- Incorrecto: `http://localhost:3001/api`
 
 ### "Timeout"
-- INCIDENT_API_TIMEOUT muy bajo
-- Aumentar en .env: `INCIDENT_API_TIMEOUT=30`
-- Verificar latencia de red
 
-## Roadmap
+- Aumentar `INCIDENT_API_TIMEOUT` en `.env` (default: 10 segundos)
+- Verificar latencia de red entre el servidor PHP y el backend
 
-Funcionalidades futuras:
-- [ ] Soporte para autenticación (JWT, API Key)
-- [ ] Caché integrado (Redis)
-- [ ] Bulk operations
-- [ ] WebSocket para actualizaciones en tiempo real
-- [ ] ORM/Query builder
+### "JSON decode error"
+
+- El backend devolvió una respuesta no-JSON (posible error de proxy o firewall)
+- Activar `LOG_LEVEL=debug` para ver la respuesta cruda en el log
+
+### Logs
+
+```bash
+# Ver logs en tiempo real
+tail -f /var/log/legacy-integration.log   # o la ruta en LOG_PATH
+
+# Formato de cada entrada:
+[2026-06-26 14:35:00] INFO: GET /api/incidents/open?page=1&limit=20 - 200 - 145ms
+[2026-06-26 14:35:05] WARNING: Retry 1/3 - Status 503
+[2026-06-26 14:35:07] ERROR: Max retries reached - Connection timeout
+```

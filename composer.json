@@ -5,8 +5,8 @@
   "license": "MIT",
   "authors": [
     {
-      "name": "Coordinadora Dev Team",
-      "email": "dev@coordinadora.local"
+      "name": "Jesus David Muñoz Gallego",
+      "email": "davidgallego092@gmail.com"
     }
   ],
   "require": {
@@ -29,6 +29,7 @@
   },
   "scripts": {
     "test": "phpunit",
+    "test-coverage": "phpunit --coverage-text --coverage-html=coverage/html",
     "phpstan": "phpstan analyse src/",
     "phpcbf": "phpcbf src/ --standard=PSR12",
     "phpcs": "phpcs src/ --standard=PSR12"

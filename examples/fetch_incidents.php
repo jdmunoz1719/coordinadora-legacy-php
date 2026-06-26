@@ -26,13 +26,15 @@ try {
         'log_level' => 'info',
     ]);
 
-    echo "Fetching incidents (page $page, limit $limit)...\n";
+    echo "Fetching open incidents (page $page, limit $limit)...\n";
     echo str_repeat('-', 120) . "\n";
 
-    $incidents = $client->getOpenIncidents([
+    $result = $client->getOpenIncidents([
         'page' => $page,
         'limit' => $limit,
     ]);
+
+    $incidents = $result['incidents'];
 
     if (empty($incidents)) {
         echo "No incidents found.\n";
@@ -62,7 +64,12 @@ try {
     }
 
     echo str_repeat('-', 120) . "\n";
-    echo sprintf("Total: %d incidents\n", count($incidents));
+    echo sprintf("Showing %d of %d total (page %d/%d)\n",
+        count($incidents),
+        $result['total'],
+        $result['page'],
+        $result['totalPages']
+    );
 } catch (IncidentClientException $e) {
     fprintf(STDERR, "Error: %s\n", $e->getMessage());
     if ($e->getHttpCode()) {

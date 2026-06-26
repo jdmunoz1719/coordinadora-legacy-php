@@ -41,25 +41,30 @@ class IncidentClient
      * Retorna lista paginada de incidentes abiertos (status = OPEN).
      *
      * @param array $filters = [
-     *     'page' => 1,
-     *     'limit' => 20,
-     *     'applicationId' => 'optional-uuid'
+     *     'page'          => 1,
+     *     'limit'         => 20,
+     *     'applicationId' => 'optional-uuid',
+     *     'severityId'    => 2,
      * ]
-     * @return Incident[]
+     * @return array{ incidents: Incident[], total: int, page: int, limit: int }
      * @throws IncidentClientException
      */
     public function getOpenIncidents(array $filters = []): array
     {
-        $page = (int)($filters['page'] ?? 1);
-        $limit = min((int)($filters['limit'] ?? 20), 100);
-        $applicationId = $filters['applicationId'] ?? null;
+        $page = (int) ($filters['page'] ?? 1);
+        $limit = min((int) ($filters['limit'] ?? 20), 100);
 
-        $queryParams = [
-            'page' => $page,
-            'limit' => $limit,
-        ];
+        $queryParams = ['page' => $page, 'limit' => $limit];
 
-        $url = $this->config->getBaseUrl() . '/incidents?' . http_build_query($queryParams);
+        if (!empty($filters['applicationId'])) {
+            $queryParams['applicationId'] = $filters['applicationId'];
+        }
+
+        if (!empty($filters['severityId'])) {
+            $queryParams['severityId'] = (int) $filters['severityId'];
+        }
+
+        $url = $this->config->getBaseUrl() . '/incidents/open?' . http_build_query($queryParams);
 
         $this->logger->debug('Fetching open incidents', ['url' => $url, 'page' => $page]);
 
@@ -67,66 +72,32 @@ class IncidentClient
             $response = $this->request('GET', $url);
             $data = json_decode($response, true);
 
-            if (!is_array($data) || !isset($data['items'])) {
+            if (!is_array($data) || !isset($data['data'])) {
                 throw new IncidentClientException('Invalid API response format');
             }
 
             $incidents = array_map(
                 fn($item) => new Incident($item),
-                $data['items']
+                $data['data']
             );
 
-            // Filtrar por aplicación si se especifica
-            if ($applicationId) {
-                $incidents = array_filter(
-                    $incidents,
-                    fn($inc) => $inc->getApplicationId() === $applicationId
-                );
-            }
-
-            $this->logger->info('Fetched incidents', [
+            $this->logger->info('Fetched open incidents', [
                 'count' => count($incidents),
                 'total' => $data['total'] ?? 0,
                 'page' => $page,
             ]);
 
-            return array_values($incidents);
+            return [
+                'incidents'  => $incidents,
+                'total'      => $data['total'] ?? 0,
+                'page'       => $data['page'] ?? $page,
+                'limit'      => $data['limit'] ?? $limit,
+                'totalPages' => $data['totalPages'] ?? 1,
+            ];
         } catch (IncidentClientException $e) {
-            $this->logger->error('Failed to fetch incidents', [
-                'error' => $e->getMessage(),
+            $this->logger->error('Failed to fetch open incidents', [
+                'error'     => $e->getMessage(),
                 'http_code' => $e->getHttpCode(),
-            ]);
-            throw $e;
-        }
-    }
-
-    /**
-     * Retorna un incidente por su ID.
-     *
-     * @throws IncidentClientException
-     */
-    public function getIncidentById(string $id): Incident
-    {
-        $url = $this->config->getBaseUrl() . '/incidents/' . urlencode($id);
-
-        $this->logger->debug('Fetching incident', ['id' => $id]);
-
-        try {
-            $response = $this->request('GET', $url);
-            $data = json_decode($response, true);
-
-            if (!is_array($data)) {
-                throw new IncidentClientException('Invalid API response');
-            }
-
-            $incident = new Incident($data);
-            $this->logger->info('Fetched incident', ['id' => $id]);
-
-            return $incident;
-        } catch (IncidentClientException $e) {
-            $this->logger->error('Failed to fetch incident', [
-                'id' => $id,
-                'error' => $e->getMessage(),
             ]);
             throw $e;
         }
@@ -146,6 +117,14 @@ class IncidentClient
     public function setMaxRetries(int $maxRetries): void
     {
         $this->maxRetries = max(0, $maxRetries);
+    }
+
+    /**
+     * Configura el delay entre reintentos en milisegundos.
+     */
+    public function setRetryDelayMs(int $ms): void
+    {
+        $this->retryDelayMs = max(0, $ms);
     }
 
     /**
@@ -197,7 +176,7 @@ class IncidentClient
      *
      * @throws IncidentClientException
      */
-    private function executeCurl(string $method, string $url): string
+    protected function executeCurl(string $method, string $url): string
     {
         $ch = curl_init();
 
@@ -219,7 +198,7 @@ class IncidentClient
             ]);
 
             $response = curl_exec($ch);
-            $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $httpCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
             $curlError = curl_error($ch);
             $curlErrno = curl_errno($ch);
 
@@ -233,12 +212,12 @@ class IncidentClient
 
             // Manejo de errores HTTP
             if ($httpCode >= 400) {
-                throw IncidentClientException::fromHttpError($httpCode, (string)$response);
+                throw IncidentClientException::fromHttpError($httpCode, (string) $response);
             }
 
-            return (string)$response;
+            return (string) $response;
         } finally {
-            curl_close($ch);
+            unset($ch);
         }
     }
 }
